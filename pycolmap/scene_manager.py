@@ -19,7 +19,7 @@ from .rotation import Quaternion
 #-------------------------------------------------------------------------------
 
 class SceneManager:
-    INVALID_POINT3D = np.uint64(-1)
+    INVALID_POINT3D = np.int64(-1)
 
     def __init__(self, colmap_results_folder, image_path=None):
         self.folder = colmap_results_folder
@@ -83,6 +83,17 @@ class SceneManager:
 
     #---------------------------------------------------------------------------
 
+    def read_next_bytes(self, fid, num_bytes, format_char_sequence, endian_character="<"):
+        """Read and unpack the next bytes from a binary file.
+        :param fid:
+        :param num_bytes: Sum of combination of {2, 4, 8}, e.g. 2, 6, 16, 30, etc.
+        :param format_char_sequence: List of {c, e, f, d, h, H, i, I, l, L, q, Q}.
+        :param endian_character: Any of {@, =, <, >, !}
+        :return: Tuple of read and unpacked values.
+        """
+        data = fid.read(num_bytes)
+        return struct.unpack(endian_character + format_char_sequence, data)
+
     def load_cameras(self, input_file=None):
         if input_file is None:
             input_file = self.folder + 'cameras.bin'
@@ -98,13 +109,18 @@ class SceneManager:
     def _load_cameras_bin(self, input_file):
         self.cameras = OrderedDict()
 
-        with open(input_file, 'rb') as f:
-            num_cameras = struct.unpack('L', f.read(8))[0]
-
+        with open(input_file, 'rb') as fid:
+            num_cameras = self.read_next_bytes(fid, 8, "Q")[0]
             for _ in range(num_cameras):
-                camera_id, camera_type, w, h = struct.unpack('IiLL', f.read(24))
+                camera_properties = self.read_next_bytes(
+                    fid, num_bytes=24, format_char_sequence="iiQQ")
+                camera_id = camera_properties[0]
+                camera_type = camera_properties[1]
+                w = camera_properties[2]
+                h = camera_properties[3]
                 num_params = Camera.GetNumParams(camera_type)
-                params = struct.unpack('d' * num_params, f.read(8 * num_params))
+                params = self.read_next_bytes(fid, num_bytes=8*num_params,
+                                         format_char_sequence="d"*num_params)
                 self.cameras[camera_id] = Camera(camera_type, w, h, params)
                 self.last_camera_id = max(self.last_camera_id, camera_id)
 
@@ -139,19 +155,22 @@ class SceneManager:
     def _load_images_bin(self, input_file):
         self.images = OrderedDict()
 
-        with open(input_file, 'rb') as f:
-            num_images = struct.unpack('L', f.read(8))[0]
-            image_struct = struct.Struct('<I 4d 3d I')
+        with open(input_file, 'rb') as fid:
+            num_images = self.read_next_bytes(fid, 8, "Q")[0]
             for _ in range(num_images):
-                data = image_struct.unpack(f.read(image_struct.size))
+                data = self.read_next_bytes(fid, num_bytes=64, format_char_sequence="idddddddi")
                 image_id = data[0]
                 q = Quaternion(np.array(data[1:5]))
                 t = np.array(data[5:8])
                 camera_id = data[8]
-                name = b''.join(c for c in iter(lambda: f.read(1), b'\x00')).decode()
+                name = ""
+                current_char = self.read_next_bytes(fid, 1, "c")[0]
+                while current_char != b"\x00":   # look for the ASCII 0 entry
+                    name += current_char.decode("utf-8")
+                    current_char = self.read_next_bytes(fid, 1, "c")[0]
 
                 image = Image(name, camera_id, q, t)
-                num_points2D = struct.unpack('Q', f.read(8))[0]
+                num_points2D = self.read_next_bytes(fid, num_bytes=8,format_char_sequence="Q")[0]
 
                 # Optimized code below.
                 # Read all elements as double first, then convert to array, slice it
@@ -159,7 +178,7 @@ class SceneManager:
                 # ('Q'). This is significantly faster than using O(num_points2D) f.read
                 # calls, experiments show >7x improvements in 60 image model, 23s -> 3s.
                 points_array = array.array('d')
-                points_array.fromfile(f, 3 * num_points2D)
+                points_array.fromfile(fid, 3 * num_points2D)
                 points_elements = np.array(points_array).reshape((num_points2D, 3))
                 image.points2D = points_elements[:, :2]
 
@@ -227,8 +246,8 @@ class SceneManager:
                     raise IOError('no points3D file found')
 
     def _load_points3D_bin(self, input_file):
-        with open(input_file, 'rb') as f:
-            num_points3D = struct.unpack('L', f.read(8))[0]
+        with open(input_file, 'rb') as fid:
+            num_points3D = self.read_next_bytes(fid, 8, "Q")[0]
 
             self.points3D = np.empty((num_points3D, 3))
             self.point3D_ids = np.empty(num_points3D, dtype=np.uint64)
@@ -237,22 +256,19 @@ class SceneManager:
             self.point3D_id_to_images = dict()
             self.point3D_errors = np.empty(num_points3D)
 
-            data_struct = struct.Struct('<Q 3d 3B d Q')
-
             for i in range(num_points3D):
-                data = data_struct.unpack(f.read(data_struct.size))
+                data = self.read_next_bytes(fid, num_bytes=43, format_char_sequence="QdddBBBd")
                 self.point3D_ids[i] = data[0]
                 self.points3D[i] = data[1:4]
                 self.point3D_colors[i] = data[4:7]
                 self.point3D_errors[i] = data[7]
-                track_len = data[8]
+                track_len = self.read_next_bytes(fid, num_bytes=8, format_char_sequence="Q")[0]
 
                 self.point3D_id_to_point3D_idx[self.point3D_ids[i]] = i
-
-                data = struct.unpack(f'{2*track_len}I', f.read(2 * track_len * 4))
+                track_elems = self.read_next_bytes(fid, num_bytes=8*track_len,format_char_sequence="ii"*track_len)
 
                 self.point3D_id_to_images[self.point3D_ids[i]] = \
-                    np.array(data, dtype=np.uint32).reshape(track_len, 2)
+                    np.array(track_elems, dtype=np.uint32).reshape(track_len, 2)
 
     def _load_points3D_txt(self, input_file):
         self.points3D = []
