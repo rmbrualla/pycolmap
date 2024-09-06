@@ -19,7 +19,7 @@ from .rotation import Quaternion
 #-------------------------------------------------------------------------------
 
 class SceneManager:
-    INVALID_POINT3D = np.uint64(-1)
+    INVALID_POINT3D = np.int64(-1)
 
     def __init__(self, colmap_results_folder, image_path=None):
         self.folder = colmap_results_folder
